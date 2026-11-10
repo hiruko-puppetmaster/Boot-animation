@@ -1,0 +1,167 @@
+name: Build Crimson Glitch KSU-Next Module
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: pip install Pillow numpy
+
+      - name: Apply Crimson Color & Glitch Effect
+        run: |
+          python3 - << 'EOF'
+          import os, shutil, zipfile, random
+          import numpy as np
+          from PIL import Image
+
+          random.seed(42)
+          np.random.seed(42)
+
+          WORK_DIR = "bootanim_work"
+          os.makedirs(WORK_DIR, exist_ok=True)
+
+          with zipfile.ZipFile("bootanimation.zip", "r") as zf:
+              zf.extractall(WORK_DIR)
+
+          def transform_frame(img_path, part_name, frame_idx):
+              im = Image.open(img_path)
+              orig_icc = im.info.get("icc_profile")
+              rgb = np.array(im.convert("RGB"), dtype=np.float32)
+
+              r_orig, g_orig, b_orig = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+              intensity = np.maximum(b_orig, g_orig * 0.85) / 255.0
+              highlight = (r_orig / 255.0) ** 1.5
+
+              new_r = np.clip((intensity ** 0.92) * 245.0 + highlight * 35.0, 0, 255)
+              new_g = np.clip((intensity ** 3.2) * 8.0 + highlight * 20.0, 0, 255)
+              new_b = np.clip((intensity ** 2.6) * 18.0 + highlight * 30.0, 0, 255)
+              res = np.stack([new_r, new_g, new_b], axis=-1).astype(np.uint8)
+
+              ys, xs = np.where(res[..., 0] > 8)
+              if len(ys) > 10:
+                  ymin, ymax = max(0, int(ys.min()) - 20), min(res.shape[0], int(ys.max()) + 20)
+                  xmin, xmax = max(0, int(xs.min()) - 40), min(res.shape[1], int(xs.max()) + 40)
+                  box_h = ymax - ymin
+
+                  is_glitch = (frame_idx % 15 in (2, 3, 4, 11, 12)) or (random.random() < 0.2)
+                  if part_name == "part0" and frame_idx < 18:
+                      is_glitch = False
+
+                  if is_glitch and box_h > 16:
+                      for _ in range(random.randint(3, 8)):
+                          sh = random.randint(3, max(5, int(box_h * 0.14)))
+                          sy = random.randint(ymin, max(ymin, ymax - sh))
+                          shift = random.choice([random.randint(-48, -8), random.randint(8, 48)])
+                          res[sy:sy + sh] = np.roll(res[sy:sy + sh], shift, axis=1)
+
+              out_im = Image.fromarray(res, mode="RGB")
+              out_p = out_im.quantize(colors=256, method=Image.Quantize.FASTOCTREE, dither=Image.Dither.NONE)
+              save_kwargs = {"optimize": True}
+              if orig_icc:
+                  save_kwargs["icc_profile"] = orig_icc
+              out_p.save(img_path, format="PNG", **save_kwargs)
+
+          for part in sorted(os.listdir(WORK_DIR)):
+              part_dir = os.path.join(WORK_DIR, part)
+              if os.path.isdir(part_dir):
+                  pngs = sorted([f for f in os.listdir(part_dir) if f.lower().endswith(".png")])
+                  for idx, fname in enumerate(pngs):
+                      transform_frame(os.path.join(part_dir, fname), part, idx)
+
+          desc_path = os.path.join(WORK_DIR, "desc.txt")
+          with open(desc_path, "rb") as f:
+              desc_bytes = f.read().replace(b"\r\n", b"\n")
+          if not desc_bytes.endswith(b"\n"):
+              desc_bytes += b"\n"
+          with open(desc_path, "wb") as f:
+              f.write(desc_bytes)
+
+          os.makedirs("module_build", exist_ok=True)
+          with zipfile.ZipFile("module_build/bootanimation.zip", "w", compression=zipfile.ZIP_STORED) as zf:
+              zf.write(desc_path, "desc.txt")
+              for part in sorted(os.listdir(WORK_DIR)):
+                  part_dir = os.path.join(WORK_DIR, part)
+                  if os.path.isdir(part_dir):
+                      for fname in sorted(os.listdir(part_dir)):
+                          if fname.lower().endswith(".png"):
+                              zf.write(os.path.join(part_dir, fname), f"{part}/{fname}")
+          EOF
+
+      - name: Package KernelSU-Next Flashable Module
+        run: |
+          mkdir -p module_build/META-INF/com/google/android
+
+          cat << 'EOF' > module_build/module.prop
+          id=crimson_glitch_bootanim
+          name=Crimson Glitch Boot Animation
+          version=v1.0
+          versionCode=1
+          author=Custom
+          description=Applies the Crimson Red Glitch boot animation via KernelSU-Next overlay.
+          EOF
+
+          cat << 'EOF' > module_build/customize.sh
+          #!/system/bin/sh
+          SKIPUNZIP=0
+          ui_print "- Installing Crimson Glitch Boot Animation..."
+          INSTALLED_COUNT=0
+          for P in /system/product/media /system/media /system/vendor/media /system/system_ext/media; do
+            ALT_P=$(echo "$P" | sed 's|^/system||')
+            if [ -f "$P/bootanimation.zip" ] || [ -f "$ALT_P/bootanimation.zip" ]; then
+              ui_print "- Found target: $P/bootanimation.zip"
+              mkdir -p "$MODPATH$P"
+              cp -f "$MODPATH/bootanimation.zip" "$MODPATH$P/bootanimation.zip"
+              INSTALLED_COUNT=$((INSTALLED_COUNT + 1))
+            fi
+          done
+          if [ "$INSTALLED_COUNT" -eq 0 ]; then
+            mkdir -p "$MODPATH/system/product/media" "$MODPATH/system/media"
+            cp -f "$MODPATH/bootanimation.zip" "$MODPATH/system/product/media/bootanimation.zip"
+            cp -f "$MODPATH/bootanimation.zip" "$MODPATH/system/media/bootanimation.zip"
+          fi
+          rm -f "$MODPATH/bootanimation.zip"
+          set_perm_recursive "$MODPATH" 0 0 0755 0644
+          EOF
+
+          cat << 'EOF' > module_build/META-INF/com/google/android/update-binary
+          #!/sbin/sh
+          umask 022
+          ui_print() { echo "$1"; }
+          OUTFD=$2
+          ZIPFILE=$3
+          mount /data 2>/dev/null
+          if [ -f /data/adb/magisk/util_functions.sh ]; then
+            . /data/adb/magisk/util_functions.sh
+            install_module
+            exit 0
+          fi
+          EOF
+
+          echo "#MAGISK" > module_build/META-INF/com/google/android/updater-script
+
+          cd module_build
+          zip -r9 ../Crimson_Glitch_BootAnimation_KSU_Next_Module.zip . -x "bootanimation.zip"
+          zip -0 ../Crimson_Glitch_BootAnimation_KSU_Next_Module.zip bootanimation.zip
+
+      - name: Upload Flashable Module Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Crimson-Glitch-KSU-Next-Module
+          path: Crimson_Glitch_BootAnimation_KSU_Next_Module.zip
+          
